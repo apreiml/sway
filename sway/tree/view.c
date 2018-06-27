@@ -3,6 +3,7 @@
 #include <wayland-server.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_output_layout.h>
+#include <wlr/xwayland.h>
 #include "list.h"
 #include "log.h"
 #include "sway/criteria.h"
@@ -463,9 +464,21 @@ void view_map(struct sway_view *view, struct wlr_surface *wlr_surface) {
 		return;
 	}
 
+	pid_t pid;
+	if (view->type == SWAY_VIEW_XWAYLAND) {
+		struct wlr_xwayland_surface *surf =
+			wlr_xwayland_surface_from_wlr_surface(wlr_surface);
+		pid = surf->pid;
+	} else {
+		struct wl_client *client =
+			wl_resource_get_client(wlr_surface->resource);
+		wl_client_get_credentials(client, &pid, NULL, NULL);
+	}
+
 	struct sway_seat *seat = input_manager_current_seat(input_manager);
 	struct sway_container *focus =
 		seat_get_focus_inactive(seat, &root_container);
+	struct sway_container *prev_focus = focus;
 	struct sway_container *cont = NULL;
 
 	// Check if there's any `assign` criteria for the view
@@ -479,17 +492,37 @@ void view_map(struct sway_view *view, struct wlr_surface *wlr_surface) {
 			if (!workspace) {
 				workspace = workspace_create(NULL, criteria->target);
 			}
+			prev_focus = focus;
 			focus = seat_get_focus_inactive(seat, workspace);
 		} else {
 			// TODO: CT_ASSIGN_OUTPUT
 		}
 	}
+	free(criterias);
+
+	if (!workspace) {
+		workspace = workspace_for_pid(pid);
+		if (workspace) {
+			prev_focus = focus;
+			focus = seat_get_focus_inactive(seat, workspace);
+		}
+	}
 	// If we're about to launch the view into the floating container, then
 	// launch it as a tiled view in the root of the workspace instead.
 	if (container_is_floating(focus)) {
+		if (prev_focus == focus) {
+			prev_focus = focus->parent->parent;
+		}
 		focus = focus->parent->parent;
 	}
-	free(criterias);
+
+	struct sway_container *_prev_ws = prev_focus;
+	if (_prev_ws->type != C_WORKSPACE) {
+		_prev_ws = container_parent(_prev_ws, C_WORKSPACE);
+	}
+	char *prev_ws = strdup(_prev_ws->name);
+	struct sway_container *prev_output = _prev_ws->parent;
+
 	cont = container_view_create(focus, view);
 
 	view->surface = wlr_surface;
@@ -522,6 +555,17 @@ void view_map(struct sway_view *view, struct wlr_surface *wlr_surface) {
 
 	container_damage_whole(cont);
 	view_handle_container_reparent(&view->container_reparent, NULL);
+
+	if (prev_focus != focus) {
+		struct sway_container *ws = workspace_by_name(prev_ws);
+		if (!ws) {
+			ws = workspace_create(prev_output, prev_ws);
+		}
+		input_manager_set_focus(input_manager, ws);
+		workspace_switch(ws);
+	}
+
+	free(prev_ws);
 }
 
 void view_unmap(struct sway_view *view) {
